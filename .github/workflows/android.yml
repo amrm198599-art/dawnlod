@@ -8,20 +8,25 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       HAS_SIGNING: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Locate project (unzip if needed)
+      - name: Locate project (uses the *OnDevice*.zip if you uploaded it)
         run: |
-          if [ ! -f package.json ] && ! find . -maxdepth 3 -name capacitor.config.* | grep -q .; then
-            for z in $(find . -maxdepth 2 -name '*.zip'); do unzip -oq "$z" -d _unzipped; done
+          ZIP=$(find . -maxdepth 2 -name '*OnDevice*.zip' | head -n 1)
+          if [ -n "$ZIP" ]; then
+            rm -rf _unzipped && unzip -oq "$ZIP" -d _unzipped
+            SEARCH=_unzipped
+          else
+            SEARCH=.
           fi
-          CFG=$(find . -maxdepth 4 -not -path '*/node_modules/*' \( -name capacitor.config.json -o -name capacitor.config.ts \) | head -n 1)
+          CFG=$(find "$SEARCH" -maxdepth 4 -not -path '*/node_modules/*' \( -name capacitor.config.json -o -name capacitor.config.ts \) | head -n 1)
           [ -n "$CFG" ] || { echo "::error::capacitor.config.* not found"; exit 1; }
           DIR=$(cd "$(dirname "$CFG")" && pwd)
+          [ -f "$DIR/scripts/configure-android.js" ] || { echo "::error::scripts/configure-android.js missing. Upload the OnDevice zip or the full project."; exit 1; }
           echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
           echo "Project: $DIR"
 
@@ -44,20 +49,13 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           npm install --no-audit --no-fund
-          npm install --no-save --no-audit --no-fund typescript
-          if [ -d client ]; then npm install --no-audit --no-fund --prefix client; fi
+          npm install --no-audit --no-fund --prefix client
 
       - name: Build web assets
         working-directory: ${{ env.PROJECT_DIR }}
         env:
           CI: 'false'
-          API_BASE_URL: ${{ vars.API_BASE_URL }}
-        run: |
-          if [ -z "$API_BASE_URL" ]; then
-            echo "::warning::API_BASE_URL variable not set. Using a placeholder; downloads will not work until you set it."
-            API_BASE_URL="https://example.com"
-          fi
-          REACT_APP_API_URL="$API_BASE_URL" npm run build
+        run: npm run build
 
       - name: Generate Android project
         working-directory: ${{ env.PROJECT_DIR }}
@@ -65,46 +63,31 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Add signing + version to Gradle
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Decode release keystore
+        if: env.HAS_SIGNING == 'true'
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          cat > android/app/signing.gradle <<'GRADLE'
-          android {
-              defaultConfig {
-                  versionCode((System.getenv("VERSION_CODE") ?: "1") as int)
-                  versionName(System.getenv("VERSION_NAME") ?: "1.0")
-              }
-              def ksPath = System.getenv("KEYSTORE_PATH")
-              if (ksPath) {
-                  signingConfigs {
-                      release {
-                          storeFile file(ksPath)
-                          storePassword System.getenv("KEYSTORE_PASSWORD")
-                          keyAlias System.getenv("KEY_ALIAS")
-                          keyPassword System.getenv("KEY_PASSWORD")
-                      }
-                  }
-                  buildTypes { release { signingConfig signingConfigs.release } }
-              }
-          }
-          GRADLE
-          printf "\napply from: 'signing.gradle'\n" >> android/app/build.gradle
-          printf "\norg.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8\n" >> android/gradle.properties
-          if [ "$HAS_SIGNING" = "true" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
-            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
-          else
-            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: building debug APK only."
-          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+
+      - name: Warn when unsigned
+        if: env.HAS_SIGNING != 'true'
+        run: echo "::warning::No ANDROID_KEYSTORE_BASE64 secret - building a debug APK only."
+
+      - name: Configure Android (on-device yt-dlp, Kotlin, signing)
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=1.0.$VERSION_CODE" >> "$GITHUB_ENV"
+          node scripts/configure-android.js
 
       - name: Build signed release (APK + AAB)
         if: env.HAS_SIGNING == 'true'
         working-directory: ${{ env.PROJECT_DIR }}/android
         env:
-          VERSION_CODE: ${{ github.run_number }}
-          VERSION_NAME: 1.0.${{ github.run_number }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
@@ -113,10 +96,18 @@ jobs:
       - name: Build debug APK
         if: env.HAS_SIGNING != 'true'
         working-directory: ${{ env.PROJECT_DIR }}/android
-        env:
-          VERSION_CODE: ${{ github.run_number }}
-          VERSION_NAME: 1.0.${{ github.run_number }}
         run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify download engine is inside the APK
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          APK=$(find app/build/outputs/apk -name '*.apk' | head -n 1)
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          unzip -l "$APK" | grep -q 'libpython.zip.so' || { echo "::error::python engine (libpython) missing from APK"; exit 1; }
+          unzip -l "$APK" | grep -q 'libffmpeg.zip.so' || { echo "::error::ffmpeg missing from APK"; exit 1; }
+          mkdir -p /tmp/apkchk && unzip -oq "$APK" 'classes*.dex' -d /tmp/apkchk
+          cat /tmp/apkchk/classes*.dex | strings | grep -q 'YtDlpPlugin' || { echo "::error::YtDlpPlugin class missing from APK"; exit 1; }
+          echo "OK: engine + plugin are packaged."
 
       - name: Upload APK / AAB
         uses: actions/upload-artifact@v4
